@@ -1,4 +1,5 @@
 pub mod activate_script_builder;
+pub mod activation_diff;
 pub mod attach;
 pub mod cli;
 pub mod env_diff;

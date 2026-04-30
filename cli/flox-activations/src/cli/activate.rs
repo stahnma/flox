@@ -88,7 +88,11 @@ impl ActivateArgs {
         // Unset FLOX_SHELL to detect the parent shell anew with each flox invocation.
         unsafe { std::env::remove_var("FLOX_SHELL") };
 
-        let vars_from_env = VarsFromEnvironment::get()?;
+        let vars_from_env = if context.capture_env_diff {
+            VarsFromEnvironment::get_with_snapshot()?
+        } else {
+            VarsFromEnvironment::get()?
+        };
 
         let start_id = self.start_or_attach(
             &context,

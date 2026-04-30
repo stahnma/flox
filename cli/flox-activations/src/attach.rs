@@ -16,6 +16,7 @@ use shell_gen::{Shell, ShellWithPath};
 use tracing::debug;
 
 use crate::activate_script_builder::{activate_tracer, apply_activation_env, old_cli_envs};
+use crate::activation_diff::{self, ActivationDiff};
 use crate::cli::activate::NO_REMOVE_ACTIVATION_FILES;
 use crate::cli::attach::{AttachArgs, AttachExclusiveArgs};
 use crate::env_diff::EnvDiff;
@@ -38,6 +39,30 @@ pub fn attach(
     // Use pre-computed activation_state_dir to get start state directory
     let start_state_dir = start_id.start_state_dir(&context.activation_state_dir)?;
     let diff = EnvDiff::from_files(&start_state_dir)?;
+
+    // Compute the activation diff when the feature flag is enabled.
+    // The snapshot is taken before any activation env modifications.
+    let activation_diff_encoded = if context.capture_env_diff {
+        let activation_diff = ActivationDiff::compute(
+            &vars_from_env,
+            &context.attach_ctx,
+            context.project_ctx.as_ref(),
+            subsystem_verbosity,
+            vars_from_env.clone(),
+            &diff,
+        );
+        let encoded = activation_diff.encode()?;
+        debug!(
+            "captured activation diff: {} added, {} modified, {} removed ({} bytes encoded)",
+            activation_diff.added.len(),
+            activation_diff.modified.len(),
+            activation_diff.removed.len(),
+            encoded.len(),
+        );
+        Some(encoded)
+    } else {
+        None
+    };
 
     // Create the path if we're going to need it (we won't for in-place).
     // We're doing this ahead of time here because it's shell-agnostic and the `match`
@@ -75,24 +100,29 @@ pub fn attach(
         //
         //    eval "$(flox activate)"
         InvocationType::InPlace => {
-            activate_in_place(startup_ctx, start_id)?;
+            activate_in_place(startup_ctx, start_id, &activation_diff_encoded)?;
             Ok(())
         },
         // All other invocation types only return if exec fails
-        InvocationType::Interactive => {
-            activate_interactive(startup_ctx, subsystem_verbosity, vars_from_env)
-        },
+        InvocationType::Interactive => activate_interactive(
+            startup_ctx,
+            subsystem_verbosity,
+            vars_from_env,
+            &activation_diff_encoded,
+        ),
         InvocationType::ShellCommand(shell_command) => activate_shell_command(
             shell_command,
             startup_ctx,
             subsystem_verbosity,
             vars_from_env,
+            &activation_diff_encoded,
         ),
         InvocationType::ExecCommand(exec_command) => activate_exec_command(
             exec_command,
             startup_ctx,
             subsystem_verbosity,
             vars_from_env,
+            &activation_diff_encoded,
         ),
     }
 }
@@ -243,6 +273,7 @@ fn activate_exec_command(
     startup_ctx: StartupCtx,
     subsystem_verbosity: u32,
     vars_from_env: VarsFromEnvironment,
+    activation_diff_encoded: &Option<String>,
 ) -> Result<()> {
     if exec_command.is_empty() {
         return Err(anyhow!("empty command provided"));
@@ -259,6 +290,9 @@ fn activate_exec_command(
         vars_from_env,
         &startup_ctx.env_diff,
     );
+    if let Some(encoded) = activation_diff_encoded {
+        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
+    }
 
     debug!("executing command directly: {:?}", command);
 
@@ -276,6 +310,7 @@ fn activate_shell_command(
     startup_ctx: StartupCtx,
     subsystem_verbosity: u32,
     vars_from_env: VarsFromEnvironment,
+    activation_diff_encoded: &Option<String>,
 ) -> Result<()> {
     let mut command = Command::new(startup_ctx.act_ctx.shell.exe_path());
     apply_activation_env(
@@ -286,6 +321,9 @@ fn activate_shell_command(
         vars_from_env,
         &startup_ctx.env_diff,
     );
+    if let Some(encoded) = activation_diff_encoded {
+        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
+    }
 
     let rcfile = startup_ctx
         .rc_path
@@ -399,6 +437,7 @@ fn activate_interactive(
     startup_ctx: StartupCtx,
     subsystem_verbosity: u32,
     vars_from_env: VarsFromEnvironment,
+    activation_diff_encoded: &Option<String>,
 ) -> Result<()> {
     let mut command = Command::new(startup_ctx.act_ctx.shell.exe_path());
     apply_activation_env(
@@ -409,6 +448,9 @@ fn activate_interactive(
         vars_from_env,
         &startup_ctx.env_diff,
     );
+    if let Some(encoded) = activation_diff_encoded {
+        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
+    }
 
     let rcfile = startup_ctx
         .rc_path
@@ -496,7 +538,11 @@ fn activate_interactive(
 }
 
 /// Used for `eval "$(flox activate)"`
-fn activate_in_place(startup_ctx: StartupCtx, start_id: StartIdentifier) -> Result<()> {
+fn activate_in_place(
+    startup_ctx: StartupCtx,
+    start_id: StartIdentifier,
+    activation_diff_encoded: &Option<String>,
+) -> Result<()> {
     let attach_command = AttachArgs {
         pid: std::process::id() as i32,
         activation_state_dir: startup_ctx.act_ctx.activation_state_dir.clone(),
@@ -561,6 +607,13 @@ fn activate_in_place(startup_ctx: StartupCtx, start_id: StartIdentifier) -> Resu
         "activation in place script, except for startup commands:\n{}",
         script
     );
+    if let Some(encoded) = activation_diff_encoded {
+        println!(
+            "export {}=\"{}\";",
+            activation_diff::FLOX_HOOK_DIFF_VAR,
+            encoded
+        );
+    }
     write_to_stdout(&startup_ctx)?;
 
     Ok(())

@@ -125,6 +125,27 @@ fn add_old_activate_script_exports(
     subsystem_verbosity: u32,
     vars_from_environment: VarsFromEnvironment,
 ) {
+    let (exports, removals) =
+        collect_activate_exports(context, project, subsystem_verbosity, vars_from_environment);
+    command.envs(&exports);
+    for var in &removals {
+        command.env_remove(var);
+    }
+}
+
+/// Collect the environment variables that should be set and unset for activation.
+///
+/// Returns a tuple of (exports, removals) where exports maps variable names to
+/// values and removals is a list of variable names to unset.
+///
+/// This is split out from `add_old_activate_script_exports` so that the data
+/// can be inspected independently — for example when computing the activation diff.
+pub fn collect_activate_exports(
+    context: &AttachCtx,
+    project: Option<&AttachProjectCtx>,
+    subsystem_verbosity: u32,
+    vars_from_environment: VarsFromEnvironment,
+) -> (HashMap<&'static str, String>, Vec<&'static str>) {
     let mut removals = Vec::new();
     let mut exports = HashMap::from([
         ("_flox_activate_tracelevel", subsystem_verbosity.to_string()),
@@ -163,10 +184,7 @@ fn add_old_activate_script_exports(
 
     exports.extend(fixed_vars_to_export(&context.env, vars_from_environment));
 
-    command.envs(&exports);
-    for var in &removals {
-        command.env_remove(var);
-    }
+    (exports, removals)
 }
 
 /// Calculate values for FLOX_ENV_DIRS, PATH, and MANPATH
