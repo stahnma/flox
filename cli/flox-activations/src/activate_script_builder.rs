@@ -7,6 +7,7 @@ use flox_core::activate::vars::FLOX_ACTIVE_ENVIRONMENTS_VAR;
 use flox_core::util::default_nix_env_vars;
 use is_executable::IsExecutable;
 
+use crate::activation_diff;
 use crate::cli::fix_paths::{fix_manpath_var, fix_path_var};
 use crate::cli::set_env_dirs::fix_env_dirs_var;
 use crate::env_diff::EnvDiff;
@@ -46,6 +47,7 @@ pub fn apply_activation_env(
     subsystem_verbosity: u32,
     vars_from_env: VarsFromEnvironment,
     env_diff: &EnvDiff,
+    activation_diff_encoded: &Option<String>,
 ) {
     command.envs(old_cli_envs(context, project));
     add_old_activate_script_exports(
@@ -58,6 +60,9 @@ pub fn apply_activation_env(
     command.envs(&env_diff.additions);
     for var in &env_diff.deletions {
         command.env_remove(var);
+    }
+    if let Some(encoded) = activation_diff_encoded {
+        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
     }
 }
 

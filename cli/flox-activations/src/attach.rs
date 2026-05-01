@@ -289,10 +289,8 @@ fn activate_exec_command(
         subsystem_verbosity,
         vars_from_env,
         &startup_ctx.env_diff,
+        activation_diff_encoded,
     );
-    if let Some(encoded) = activation_diff_encoded {
-        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
-    }
 
     debug!("executing command directly: {:?}", command);
 
@@ -320,10 +318,8 @@ fn activate_shell_command(
         subsystem_verbosity,
         vars_from_env,
         &startup_ctx.env_diff,
+        activation_diff_encoded,
     );
-    if let Some(encoded) = activation_diff_encoded {
-        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
-    }
 
     let rcfile = startup_ctx
         .rc_path
@@ -447,10 +443,8 @@ fn activate_interactive(
         subsystem_verbosity,
         vars_from_env,
         &startup_ctx.env_diff,
+        activation_diff_encoded,
     );
-    if let Some(encoded) = activation_diff_encoded {
-        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
-    }
 
     let rcfile = startup_ctx
         .rc_path
