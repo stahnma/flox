@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 
 use anyhow::Result;
+use base64::Engine as _;
 use flox_core::activate::context::{AttachCtx, AttachProjectCtx};
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +36,7 @@ pub struct ActivationDiff {
 fn diff_env(
     current_env: &HashMap<String, String>,
     intended_sets: &HashMap<String, String>,
-    intended_removals: &std::collections::HashSet<String>,
+    intended_removals: &HashSet<String>,
 ) -> ActivationDiff {
     // Removal overrides addition: drop any set that is also scheduled for removal.
     let sets_without_overrides: HashMap<&String, &String> = intended_sets
@@ -110,8 +112,7 @@ impl ActivationDiff {
         }
 
         // Collect all intended removals.
-        let mut intended_removals: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut intended_removals: HashSet<String> = HashSet::new();
 
         // From collect_activate_exports removal list.
         for k in &removal_list {
@@ -160,10 +161,6 @@ impl ActivationDiff {
 
     /// Serialize to zlib-compressed base64url JSON.
     pub fn encode(&self) -> Result<String> {
-        use std::io::Write;
-
-        use base64::Engine;
-
         let json = serde_json::to_vec(self)?;
         let mut encoder =
             flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -176,10 +173,6 @@ impl ActivationDiff {
     ///
     /// Used for deactivation to restore the original environment.
     pub fn decode(encoded: &str) -> Result<Self> {
-        use std::io::Read;
-
-        use base64::Engine;
-
         let compressed = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?;
         let mut decoder = flate2::read::ZlibDecoder::new(&compressed[..]);
         let mut json = Vec::new();
