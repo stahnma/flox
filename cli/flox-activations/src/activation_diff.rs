@@ -6,7 +6,7 @@ use base64::Engine as _;
 use flox_core::activate::context::{AttachCtx, AttachProjectCtx};
 use serde::{Deserialize, Serialize};
 
-use crate::activate_script_builder::{collect_activate_exports, old_cli_envs};
+use crate::activate_script_builder::collect_activation_vars;
 use crate::env_diff::EnvDiff;
 use crate::vars_from_env::VarsFromEnvironment;
 
@@ -91,39 +91,13 @@ impl ActivationDiff {
         vars_from_env: VarsFromEnvironment,
         env_diff: &EnvDiff,
     ) -> Self {
-        // Collect all intended sets by merging (later overrides earlier).
-        let mut intended_sets: HashMap<String, String> = HashMap::new();
-
-        // 1. old_cli_envs: HashMap<&'static str, String>
-        for (k, v) in old_cli_envs(context, project) {
-            intended_sets.insert(k.to_string(), v);
-        }
-
-        // 2. collect_activate_exports: (HashMap<&'static str, String>, Vec<&'static str>)
-        let (export_map, removal_list) =
-            collect_activate_exports(context, project, subsystem_verbosity, vars_from_env);
-        for (k, v) in export_map {
-            intended_sets.insert(k.to_string(), v);
-        }
-
-        // 3. env_diff.additions: HashMap<String, String>
-        for (k, v) in &env_diff.additions {
-            intended_sets.insert(k.clone(), v.clone());
-        }
-
-        // Collect all intended removals.
-        let mut intended_removals: HashSet<String> = HashSet::new();
-
-        // From collect_activate_exports removal list.
-        for k in &removal_list {
-            intended_removals.insert(k.to_string());
-        }
-
-        // From env_diff.deletions.
-        for k in &env_diff.deletions {
-            intended_removals.insert(k.clone());
-        }
-
+        let (intended_sets, intended_removals) = collect_activation_vars(
+            context,
+            project,
+            subsystem_verbosity,
+            vars_from_env,
+            env_diff,
+        );
         diff_env(current_env, &intended_sets, &intended_removals)
     }
 

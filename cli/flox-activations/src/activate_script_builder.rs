@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -39,6 +39,47 @@ pub(super) fn assemble_activate_command(
     command
 }
 
+/// Collect all environment variable sets and removals needed for activation.
+///
+/// Returns `(intended_sets, intended_removals)` where:
+/// - `intended_sets`: variables to set, with later sources overriding earlier ones
+///   (old_cli_envs -> collect_activate_exports -> env_diff.additions)
+/// - `intended_removals`: variables to unset
+///   (collect_activate_exports removals + env_diff.deletions)
+pub fn collect_activation_vars(
+    context: &AttachCtx,
+    project: Option<&AttachProjectCtx>,
+    subsystem_verbosity: u32,
+    vars_from_env: VarsFromEnvironment,
+    env_diff: &EnvDiff,
+) -> (HashMap<String, String>, HashSet<String>) {
+    let mut intended_sets: HashMap<String, String> = HashMap::new();
+
+    for (k, v) in old_cli_envs(context, project) {
+        intended_sets.insert(k.to_string(), v);
+    }
+
+    let (export_map, removal_list) =
+        collect_activate_exports(context, project, subsystem_verbosity, vars_from_env);
+    for (k, v) in export_map {
+        intended_sets.insert(k.to_string(), v);
+    }
+
+    for (k, v) in &env_diff.additions {
+        intended_sets.insert(k.clone(), v.clone());
+    }
+
+    let mut intended_removals: HashSet<String> = HashSet::new();
+    for k in &removal_list {
+        intended_removals.insert(k.to_string());
+    }
+    for k in &env_diff.deletions {
+        intended_removals.insert(k.clone());
+    }
+
+    (intended_sets, intended_removals)
+}
+
 /// Set (and unset) environment variables needed to be activated.
 pub fn apply_activation_env(
     command: &mut Command,
@@ -49,16 +90,15 @@ pub fn apply_activation_env(
     env_diff: &EnvDiff,
     activation_diff_encoded: &Option<String>,
 ) {
-    command.envs(old_cli_envs(context, project));
-    add_old_activate_script_exports(
-        command,
+    let (sets, removals) = collect_activation_vars(
         context,
         project,
         subsystem_verbosity,
         vars_from_env,
+        env_diff,
     );
-    command.envs(&env_diff.additions);
-    for var in &env_diff.deletions {
+    command.envs(&sets);
+    for var in &removals {
         command.env_remove(var);
     }
     if let Some(encoded) = activation_diff_encoded {
