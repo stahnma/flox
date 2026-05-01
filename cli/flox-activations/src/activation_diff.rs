@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_additions() {
+    fn compute_additions() {
         let current = make_env(&[("EXISTING", "value")]);
         let sets = make_env(&[("NEW_VAR", "new_value")]);
         let diff = diff_env(&current, &sets, &make_removals(&[]));
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_modifications() {
+    fn compute_modifications() {
         let current = make_env(&[("MY_VAR", "old_value")]);
         let sets = make_env(&[("MY_VAR", "new_value")]);
         let diff = diff_env(&current, &sets, &make_removals(&[]));
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_removals() {
+    fn compute_removals() {
         let current = make_env(&[("GONE_VAR", "gone_value")]);
         let diff = diff_env(&current, &HashMap::new(), &make_removals(&["GONE_VAR"]));
 
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_mixed() {
+    fn compute_mixed() {
         let current = make_env(&[("MODIFIED_VAR", "orig"), ("REMOVED_VAR", "to_remove")]);
         let sets = make_env(&[("NEW_VAR", "new"), ("MODIFIED_VAR", "changed")]);
         let diff = diff_env(&current, &sets, &make_removals(&["REMOVED_VAR"]));
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deletion_overrides_addition() {
+    fn deletion_overrides_addition() {
         // A var that appears in both intended_sets and intended_removals should
         // end up in the removed category only (removal wins).
         let current = make_env(&[("CONFLICT_VAR", "current_value")]);
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_roundtrip() {
+    fn encode_decode_roundtrip() {
         let original = ActivationDiff {
             added: make_env(&[("NEW_VAR", "new_value")]),
             modified: make_env(&[("MOD_VAR", "original_value")]),
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_changes_empty_diff() {
+    fn no_changes_empty_diff() {
         let current = make_env(&[("UNCHANGED", "value")]);
         // Sets contain the same key/value as current, and no removals.
         let sets = make_env(&[("UNCHANGED", "value")]);

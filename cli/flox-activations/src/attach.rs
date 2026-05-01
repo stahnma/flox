@@ -608,11 +608,30 @@ fn activate_in_place(
         script
     );
     if let Some(encoded) = activation_diff_encoded {
-        println!(
-            "export {}=\"{}\";",
-            activation_diff::FLOX_HOOK_DIFF_VAR,
-            encoded
-        );
+        let export_stmt = match startup_ctx.act_ctx.shell {
+            ShellWithPath::Bash(_) | ShellWithPath::Zsh(_) => {
+                format!(
+                    "export {}=\"{}\";",
+                    activation_diff::FLOX_HOOK_DIFF_VAR,
+                    encoded
+                )
+            },
+            ShellWithPath::Fish(_) => {
+                format!(
+                    "set -gx {} \"{}\";",
+                    activation_diff::FLOX_HOOK_DIFF_VAR,
+                    encoded
+                )
+            },
+            ShellWithPath::Tcsh(_) => {
+                format!(
+                    "setenv {} \"{}\";",
+                    activation_diff::FLOX_HOOK_DIFF_VAR,
+                    encoded
+                )
+            },
+        };
+        println!("{export_stmt}");
     }
     write_to_stdout(&startup_ctx)?;
 
