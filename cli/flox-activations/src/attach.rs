@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, IsTerminal};
 use std::os::unix::process::CommandExt;
@@ -6,16 +5,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Result, anyhow};
-use flox_core::activate::context::{ActivateCtx, InvocationType};
+use flox_core::activate::context::{ActivateCtx, AttachCtx, AttachProjectCtx, InvocationType};
 use flox_core::activate::vars::FLOX_ACTIVATIONS_BIN;
 use flox_core::activations::StartIdentifier;
 use indoc::formatdoc;
 use itertools::Itertools;
 use nix::unistd::{close, dup2_stdin, pipe, write};
-use shell_gen::{Shell, ShellWithPath};
+use shell_gen::{GenerateShell, SetVar, Shell, ShellWithPath, UnsetVar};
 use tracing::debug;
 
-use crate::activate_script_builder::{activate_tracer, apply_activation_env, old_cli_envs};
+use crate::activate_script_builder::{
+    activate_tracer,
+    apply_activation_env,
+    collect_activation_vars,
+};
 use crate::activation_diff::{self, ActivationDiff};
 use crate::cli::activate::NO_REMOVE_ACTIVATION_FILES;
 use crate::cli::attach::{AttachArgs, AttachExclusiveArgs};
@@ -100,7 +103,13 @@ pub fn attach(
         //
         //    eval "$(flox activate)"
         InvocationType::InPlace => {
-            activate_in_place(startup_ctx, start_id, &activation_diff_encoded)?;
+            activate_in_place(
+                startup_ctx,
+                start_id,
+                subsystem_verbosity,
+                vars_from_env,
+                &activation_diff_encoded,
+            )?;
             Ok(())
         },
         // All other invocation types only return if exec fails
@@ -535,6 +544,8 @@ fn activate_interactive(
 fn activate_in_place(
     startup_ctx: StartupCtx,
     start_id: StartIdentifier,
+    subsystem_verbosity: u32,
+    vars_from_env: VarsFromEnvironment,
     activation_diff_encoded: &Option<String>,
 ) -> Result<()> {
     let attach_command = AttachArgs {
@@ -551,7 +562,16 @@ fn activate_in_place(
     // Put a 5 second timeout on the activation
     attach_command.handle()?;
 
-    let legacy_exports = render_legacy_exports(&startup_ctx.act_ctx);
+    let shell = Shell::from(startup_ctx.act_ctx.shell.clone());
+    let activation_exports = render_activation_exports(
+        &startup_ctx.act_ctx.attach_ctx,
+        startup_ctx.act_ctx.project_ctx.as_ref(),
+        subsystem_verbosity,
+        vars_from_env,
+        &startup_ctx.env_diff,
+        activation_diff_encoded,
+        shell,
+    )?;
 
     let exports_for_zsh = if matches!(startup_ctx.act_ctx.shell, ShellWithPath::Zsh(_)) {
         let zdotdir_path = startup_ctx
@@ -559,32 +579,26 @@ fn activate_in_place(
             .attach_ctx
             .interpreter_path
             .join("activate.d/zdotdir");
-        let mut exports = String::new();
+        let mut buf: Vec<u8> = Vec::new();
 
         // TODO: it would probably be better to just not touch ZDOTDIR in
         // the zsh startup script if invocation type is in-place
         if let Ok(current_zdotdir) = std::env::var("ZDOTDIR")
             && !current_zdotdir.is_empty()
         {
-            exports.push_str(&format!(
-                "export FLOX_ORIG_ZDOTDIR=\"{}\";\n",
-                current_zdotdir
-            ));
+            SetVar::exported_no_expansion("FLOX_ORIG_ZDOTDIR", &current_zdotdir)
+                .generate_with_newline(Shell::Zsh, &mut buf)?;
         }
-        exports.push_str(&format!("export ZDOTDIR=\"{}\";\n", zdotdir_path.display()));
+        SetVar::exported_no_expansion("ZDOTDIR", zdotdir_path.display().to_string())
+            .generate_with_newline(Shell::Zsh, &mut buf)?;
 
-        exports.push_str(&format!(
-            "export _flox_activate_tracer=\"{}\";\n",
-            activate_tracer(&startup_ctx.act_ctx.attach_ctx.interpreter_path)
-        ));
-
-        exports
+        String::from_utf8(buf).expect("shell statements should be valid UTF-8")
     } else {
         String::new()
     };
 
     let script = formatdoc! {r#"
-            {legacy_exports}
+            {activation_exports}
             {flox_activations} attach --activation-state-dir "{activation_state_dir}" --pid {self_pid_var} --store-path "{store_path}" --timestamp "{timestamp}" --remove-pid "{pid}";
             {exports_for_zsh}
         "#,
@@ -601,54 +615,49 @@ fn activate_in_place(
         "activation in place script, except for startup commands:\n{}",
         script
     );
-    if let Some(encoded) = activation_diff_encoded {
-        let export_stmt = match startup_ctx.act_ctx.shell {
-            ShellWithPath::Bash(_) | ShellWithPath::Zsh(_) => {
-                format!(
-                    "export {}=\"{}\";",
-                    activation_diff::FLOX_HOOK_DIFF_VAR,
-                    encoded
-                )
-            },
-            ShellWithPath::Fish(_) => {
-                format!(
-                    "set -gx {} \"{}\";",
-                    activation_diff::FLOX_HOOK_DIFF_VAR,
-                    encoded
-                )
-            },
-            ShellWithPath::Tcsh(_) => {
-                format!(
-                    "setenv {} \"{}\";",
-                    activation_diff::FLOX_HOOK_DIFF_VAR,
-                    encoded
-                )
-            },
-        };
-        println!("{export_stmt}");
-    }
     write_to_stdout(&startup_ctx)?;
 
     Ok(())
 }
 
-/// The CLI used to print export statements for in-place activations for
-/// every environment variable set prior to invoking the activate script
-fn render_legacy_exports(context: &ActivateCtx) -> String {
-    // Render the exports in the correct shell dialect.
-    old_cli_envs(&context.attach_ctx, context.project_ctx.as_ref())
-        .iter()
-        .map(|(key, value)| (key, shell_escape::escape(Cow::Borrowed(value))))
-        // TODO: we should use a method on Shell here, possibly using
-        // shell_escape in the Shell method?
-        // But not quoting here is intentional because we already use shell_escape
-        .map(|(key, value)| match context.shell {
-            ShellWithPath::Bash(_) => format!("export {key}={value};",),
-            ShellWithPath::Fish(_) => format!("set -gx {key} {value};",),
-            ShellWithPath::Tcsh(_) => format!("setenv {key} {value};",),
-            ShellWithPath::Zsh(_) => format!("export {key}={value};",),
-        })
-        .join("\n")
+/// Render all activation environment variables as shell export statements.
+///
+/// Uses `collect_activation_vars` — the same source as `apply_activation_env`
+/// and `ActivationDiff::compute_from_snapshot` — so that in-place activations
+/// set the same variables as other invocation types.
+fn render_activation_exports(
+    context: &AttachCtx,
+    project: Option<&AttachProjectCtx>,
+    subsystem_verbosity: u32,
+    vars_from_env: VarsFromEnvironment,
+    env_diff: &EnvDiff,
+    activation_diff_encoded: &Option<String>,
+    shell: Shell,
+) -> Result<String> {
+    let (sets, removals) = collect_activation_vars(
+        context,
+        project,
+        subsystem_verbosity,
+        vars_from_env,
+        env_diff,
+    );
+
+    let mut buf: Vec<u8> = Vec::new();
+
+    // Sort for deterministic output.
+    for (key, value) in sets.iter().sorted_by_key(|(k, _)| k.as_str()) {
+        SetVar::exported_no_expansion(key, value).generate_with_newline(shell, &mut buf)?;
+    }
+    for key in removals.iter().sorted() {
+        UnsetVar::new(key).generate_with_newline(shell, &mut buf)?;
+    }
+
+    if let Some(encoded) = activation_diff_encoded {
+        SetVar::exported_no_expansion(activation_diff::FLOX_HOOK_DIFF_VAR, encoded)
+            .generate_with_newline(shell, &mut buf)?;
+    }
+
+    Ok(String::from_utf8(buf).expect("shell statements should be valid UTF-8"))
 }
 
 /// Quote run args so that words don't get split,
