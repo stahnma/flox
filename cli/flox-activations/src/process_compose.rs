@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 use tracing::{debug, info};
 
-use crate::activate_script_builder::apply_activation_env;
+use crate::activate_script_builder::ActivationEnv;
 use crate::env_diff::EnvDiff;
 use crate::vars_from_env::VarsFromEnvironment;
 
@@ -97,15 +97,14 @@ pub fn start_process_compose_no_services(
     let vars_from_env = VarsFromEnvironment::get()?;
     // Load the environment diff for the activation that we're attaching to.
     let env_diff = EnvDiff::from_files(&start_state_dir)?;
-    apply_activation_env(
-        &mut command,
+    let activation_env = ActivationEnv::new(
         attach_ctx,
         Some(project),
         subsystem_verbosity,
         vars_from_env,
         &env_diff,
-        &None,
-    );
+    )?;
+    activation_env.apply_to_command(&mut command);
 
     command
         .env("NO_COLOR", "1")

@@ -2,12 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
+use anyhow::Result;
 use flox_core::activate::context::{ActivateCtx, AttachCtx, AttachProjectCtx};
 use flox_core::activate::vars::FLOX_ACTIVE_ENVIRONMENTS_VAR;
 use flox_core::util::default_nix_env_vars;
 use is_executable::IsExecutable;
+use tracing::debug;
 
-use crate::activation_diff;
+use crate::activation_diff::{self, ActivationDiff};
 use crate::cli::fix_paths::{fix_manpath_var, fix_path_var};
 use crate::cli::set_env_dirs::fix_env_dirs_var;
 use crate::env_diff::EnvDiff;
@@ -39,70 +41,152 @@ pub(super) fn assemble_activate_command(
     command
 }
 
-/// Collect all environment variable sets and removals needed for activation.
+/// The complete set of environment variable changes needed for activation.
 ///
-/// Returns `(intended_sets, intended_removals)` where:
-/// - `intended_sets`: variables to set, with later sources overriding earlier ones
-///   (old_cli_envs -> collect_activate_exports -> env_diff.additions)
-/// - `intended_removals`: variables to unset
-///   (collect_activate_exports removals + env_diff.deletions)
-pub fn collect_activation_vars(
-    context: &AttachCtx,
-    project: Option<&AttachProjectCtx>,
-    subsystem_verbosity: u32,
-    vars_from_env: VarsFromEnvironment,
-    env_diff: &EnvDiff,
-) -> (HashMap<String, String>, HashSet<String>) {
-    let mut intended_sets: HashMap<String, String> = HashMap::new();
-
-    for (k, v) in old_cli_envs(context, project) {
-        intended_sets.insert(k.to_string(), v);
-    }
-
-    let (export_map, removal_list) =
-        collect_activate_exports(context, project, subsystem_verbosity, vars_from_env);
-    for (k, v) in export_map {
-        intended_sets.insert(k.to_string(), v);
-    }
-
-    for (k, v) in &env_diff.additions {
-        intended_sets.insert(k.clone(), v.clone());
-    }
-
-    let mut intended_removals: HashSet<String> = HashSet::new();
-    for k in &removal_list {
-        intended_removals.insert(k.to_string());
-    }
-    for k in &env_diff.deletions {
-        intended_removals.insert(k.clone());
-    }
-
-    (intended_sets, intended_removals)
+/// Constructed once from the activation context, this struct is the single
+/// source of truth for what variables to set and unset. All consumers
+/// (command application, in-place export rendering, activation diff
+/// computation) draw from the same data.
+#[derive(Debug, Clone)]
+pub struct ActivationEnv {
+    /// Variables to set on the command/shell.
+    pub sets: HashMap<String, String>,
+    /// Variables to unset from the command/shell.
+    pub removals: HashSet<String>,
+    /// Pre-encoded diff string for _FLOX_HOOK_DIFF. None if snapshot unavailable.
+    pub encoded_diff: Option<String>,
 }
 
-/// Set (and unset) environment variables needed to be activated.
-pub fn apply_activation_env(
-    command: &mut Command,
-    context: &AttachCtx,
-    project: Option<&AttachProjectCtx>,
-    subsystem_verbosity: u32,
-    vars_from_env: VarsFromEnvironment,
-    env_diff: &EnvDiff,
-    activation_diff_encoded: &Option<String>,
-) {
-    let (sets, removals) = collect_activation_vars(
-        context,
-        project,
-        subsystem_verbosity,
-        vars_from_env,
-        env_diff,
-    );
-    command.envs(&sets);
-    for var in &removals {
-        command.env_remove(var);
+impl ActivationEnv {
+    /// Assemble all environment variable sets and removals needed for
+    /// activation, and compute the activation diff if a pre-activation
+    /// snapshot is available.
+    ///
+    /// Sources are applied in precedence order (later overrides earlier):
+    /// 1. `old_cli_envs()` — FLOX_* context vars + default nix vars
+    /// 2. `collect_activate_exports()` — activation context vars
+    /// 3. `env_diff.additions` / `env_diff.deletions` — from activation scripts
+    pub fn new(
+        context: &AttachCtx,
+        project: Option<&AttachProjectCtx>,
+        subsystem_verbosity: u32,
+        mut vars_from_env: VarsFromEnvironment,
+        env_diff: &EnvDiff,
+    ) -> Result<Self> {
+        // Extract the pre-activation snapshot before consuming vars_from_env.
+        let full_env = vars_from_env.full_env.take();
+
+        // Assemble sets and removals.
+        let mut sets: HashMap<String, String> = HashMap::new();
+
+        for (k, v) in old_cli_envs(context, project) {
+            sets.insert(k.to_string(), v);
+        }
+
+        let (export_map, removal_list) =
+            collect_activate_exports(context, project, subsystem_verbosity, vars_from_env);
+        for (k, v) in export_map {
+            sets.insert(k.to_string(), v);
+        }
+
+        for (k, v) in &env_diff.additions {
+            sets.insert(k.clone(), v.clone());
+        }
+
+        let mut removals: HashSet<String> = HashSet::new();
+        for k in &removal_list {
+            removals.insert(k.to_string());
+        }
+        for k in &env_diff.deletions {
+            removals.insert(k.clone());
+        }
+
+        // Compute the activation diff if we have a pre-activation snapshot.
+        let encoded_diff = if let Some(ref current_env) = full_env {
+            let diff = diff_env(current_env, &sets, &removals);
+            let encoded = diff.encode()?;
+            debug!(
+                "captured activation diff: {} added, {} modified, {} removed ({} bytes encoded)",
+                diff.added.len(),
+                diff.modified.len(),
+                diff.removed.len(),
+                encoded.len(),
+            );
+            Some(encoded)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            sets,
+            removals,
+            encoded_diff,
+        })
     }
-    if let Some(encoded) = activation_diff_encoded {
-        command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
+
+    /// Apply the activation environment to a Command.
+    ///
+    /// Sets all accumulated variables, removes all accumulated removals,
+    /// and sets the _FLOX_HOOK_DIFF env var if a diff was computed.
+    pub fn apply_to_command(&self, command: &mut Command) {
+        command.envs(&self.sets);
+        for var in &self.removals {
+            command.env_remove(var);
+        }
+        if let Some(ref encoded) = self.encoded_diff {
+            command.env(activation_diff::FLOX_HOOK_DIFF_VAR, encoded);
+        }
+    }
+}
+
+/// Compute the diff between the current environment and the intended
+/// post-activation state.
+///
+/// `intended_sets` and `intended_removals` are pre-assembled by the caller.
+/// When a key appears in both, removal wins (it is excluded from the diff's
+/// `added`/`modified` categories and placed in `removed` if it existed).
+fn diff_env(
+    current_env: &HashMap<String, String>,
+    intended_sets: &HashMap<String, String>,
+    intended_removals: &HashSet<String>,
+) -> ActivationDiff {
+    // Removal overrides addition: drop any set that is also scheduled for removal.
+    let sets_without_overrides: HashMap<&String, &String> = intended_sets
+        .iter()
+        .filter(|(k, _)| !intended_removals.contains(*k))
+        .collect();
+
+    let mut added = HashMap::new();
+    let mut modified = HashMap::new();
+    let mut removed = HashMap::new();
+
+    for (k, new_val) in &sets_without_overrides {
+        match current_env.get(*k) {
+            None => {
+                // Key not in current env: it will be newly added.
+                added.insert((*k).clone(), (*new_val).clone());
+            },
+            Some(old_val) if old_val != *new_val => {
+                // Key exists but value will change: store original value.
+                modified.insert((*k).clone(), old_val.clone());
+            },
+            Some(_) => {
+                // Value unchanged: not part of the diff.
+            },
+        }
+    }
+
+    for k in intended_removals {
+        if let Some(old_val) = current_env.get(k) {
+            // Key is in current env and will be removed: store original value.
+            removed.insert(k.clone(), old_val.clone());
+        }
+    }
+
+    ActivationDiff {
+        added,
+        modified,
+        removed,
     }
 }
 
@@ -277,5 +361,93 @@ pub fn activate_tracer(interpreter_path: impl AsRef<Path>) -> String {
         }
     } else {
         "true".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    fn make_env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn make_removals(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn compute_additions() {
+        let current = make_env(&[("EXISTING", "value")]);
+        let sets = make_env(&[("NEW_VAR", "new_value")]);
+        let diff = diff_env(&current, &sets, &make_removals(&[]));
+
+        assert_eq!(diff.added, make_env(&[("NEW_VAR", "new_value")]));
+        assert!(diff.modified.is_empty());
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn compute_modifications() {
+        let current = make_env(&[("MY_VAR", "old_value")]);
+        let sets = make_env(&[("MY_VAR", "new_value")]);
+        let diff = diff_env(&current, &sets, &make_removals(&[]));
+
+        // modified stores original value
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.modified, make_env(&[("MY_VAR", "old_value")]));
+        assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn compute_removals() {
+        let current = make_env(&[("GONE_VAR", "gone_value")]);
+        let diff = diff_env(&current, &HashMap::new(), &make_removals(&["GONE_VAR"]));
+
+        // removed stores original value
+        assert!(diff.added.is_empty());
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.removed, make_env(&[("GONE_VAR", "gone_value")]));
+    }
+
+    #[test]
+    fn compute_mixed() {
+        let current = make_env(&[("MODIFIED_VAR", "orig"), ("REMOVED_VAR", "to_remove")]);
+        let sets = make_env(&[("NEW_VAR", "new"), ("MODIFIED_VAR", "changed")]);
+        let diff = diff_env(&current, &sets, &make_removals(&["REMOVED_VAR"]));
+
+        assert_eq!(diff.added, make_env(&[("NEW_VAR", "new")]));
+        assert_eq!(diff.modified, make_env(&[("MODIFIED_VAR", "orig")]));
+        assert_eq!(diff.removed, make_env(&[("REMOVED_VAR", "to_remove")]));
+    }
+
+    #[test]
+    fn deletion_overrides_addition() {
+        // A var that appears in both intended_sets and intended_removals should
+        // end up in the removed category only (removal wins).
+        let current = make_env(&[("CONFLICT_VAR", "current_value")]);
+        let sets = make_env(&[("CONFLICT_VAR", "new_value")]);
+        let diff = diff_env(&current, &sets, &make_removals(&["CONFLICT_VAR"]));
+
+        assert!(diff.added.is_empty());
+        assert!(diff.modified.is_empty());
+        assert_eq!(diff.removed, make_env(&[("CONFLICT_VAR", "current_value")]));
+    }
+
+    #[test]
+    fn no_changes_empty_diff() {
+        let current = make_env(&[("UNCHANGED", "value")]);
+        // Sets contain the same key/value as current, and no removals.
+        let sets = make_env(&[("UNCHANGED", "value")]);
+        let diff = diff_env(&current, &sets, &make_removals(&[]));
+
+        assert!(diff.added.is_empty());
+        assert!(diff.modified.is_empty());
+        assert!(diff.removed.is_empty());
     }
 }
