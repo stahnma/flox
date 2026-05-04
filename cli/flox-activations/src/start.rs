@@ -33,12 +33,12 @@ use uuid::Uuid;
 
 use crate::activate_script_builder::assemble_activate_command;
 use crate::cli::executive::ExecutiveCtx;
-use crate::env_diff::ENV_DIFF_END_JSON;
 use crate::process_compose::{
     process_compose_down,
     start_services_via_socket,
     wait_for_socket_ready,
 };
+use crate::start_diff::ENV_DIFF_END_JSON;
 use crate::vars_from_env::VarsFromEnvironment;
 
 /// Start a new activation because we either have a:

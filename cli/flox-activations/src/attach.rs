@@ -14,16 +14,16 @@ use nix::unistd::{close, dup2_stdin, pipe, write};
 use shell_gen::{GenerateShell, SetVar, Shell, ShellWithPath, UnsetVar};
 use tracing::debug;
 
-use crate::activate_script_builder::{ActivationEnv, activate_tracer};
+use crate::activate_script_builder::{AttachDiff, activate_tracer};
 use crate::activation_diff;
 use crate::cli::activate::NO_REMOVE_ACTIVATION_FILES;
 use crate::cli::attach::{AttachArgs, AttachExclusiveArgs};
-use crate::env_diff::EnvDiff;
 use crate::gen_rc::bash::{BashStartupArgs, generate_bash_startup_commands};
 use crate::gen_rc::fish::{FishStartupArgs, generate_fish_startup_commands};
 use crate::gen_rc::tcsh::{TcshStartupArgs, generate_tcsh_startup_commands};
 use crate::gen_rc::zsh::{ZshStartupArgs, generate_zsh_startup_commands};
 use crate::gen_rc::{StartupArgs, StartupCtx};
+use crate::start_diff::StartDiff;
 use crate::vars_from_env::VarsFromEnvironment;
 
 pub const STARTUP_SCRIPT_PATH_OVERRIDE_VAR: &str = "_FLOX_RC_FILE_PATH";
@@ -37,11 +37,11 @@ pub fn attach(
 ) -> Result<(), anyhow::Error> {
     // Use pre-computed activation_state_dir to get start state directory
     let start_state_dir = start_id.start_state_dir(&context.activation_state_dir)?;
-    let diff = EnvDiff::from_files(&start_state_dir)?;
+    let diff = StartDiff::from_files(&start_state_dir)?;
 
     // Construct the activation environment once — collects vars, computes
     // the diff, and encodes it. All consumers share this single source of truth.
-    let activation_env = ActivationEnv::new(
+    let attach_diff = AttachDiff::new(
         &context.attach_ctx,
         context.project_ctx.as_ref(),
         subsystem_verbosity,
@@ -85,16 +85,16 @@ pub fn attach(
         //
         //    eval "$(flox activate)"
         InvocationType::InPlace => {
-            activate_in_place(startup_ctx, start_id, &activation_env)?;
+            activate_in_place(startup_ctx, start_id, &attach_diff)?;
             Ok(())
         },
         // All other invocation types only return if exec fails
-        InvocationType::Interactive => activate_interactive(startup_ctx, &activation_env),
+        InvocationType::Interactive => activate_interactive(startup_ctx, &attach_diff),
         InvocationType::ShellCommand(shell_command) => {
-            activate_shell_command(shell_command, startup_ctx, &activation_env)
+            activate_shell_command(shell_command, startup_ctx, &attach_diff)
         },
         InvocationType::ExecCommand(exec_command) => {
-            activate_exec_command(exec_command, startup_ctx, &activation_env)
+            activate_exec_command(exec_command, startup_ctx, &attach_diff)
         },
     }
 }
@@ -105,7 +105,7 @@ fn startup_ctx(
     ctx: ActivateCtx,
     invocation_type: InvocationType,
     rc_path: Option<PathBuf>,
-    env_diff: EnvDiff,
+    start_diff: StartDiff,
     start_state_dir: &Path,
     activate_tracer: &str,
     subsystem_verbosity: u32,
@@ -190,7 +190,7 @@ fn startup_ctx(
     Ok(StartupCtx {
         args,
         start_state_dir: start_state_dir.to_path_buf(),
-        env_diff,
+        start_diff,
         rc_path,
         act_ctx: ctx,
     })
@@ -205,16 +205,16 @@ fn write_to_path(ctx: &StartupCtx, path: &Path) -> Result<()> {
         .open(path)?;
     match ctx.args {
         StartupArgs::Bash(ref args) => {
-            generate_bash_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_bash_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
         StartupArgs::Fish(ref args) => {
-            generate_fish_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_fish_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
         StartupArgs::Tcsh(ref args) => {
-            generate_tcsh_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_tcsh_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
         StartupArgs::Zsh(ref args) => {
-            generate_zsh_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_zsh_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
     }
     Ok(())
@@ -224,16 +224,16 @@ fn write_to_stdout(ctx: &StartupCtx) -> Result<()> {
     let mut writer = std::io::stdout();
     match ctx.args {
         StartupArgs::Bash(ref args) => {
-            generate_bash_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_bash_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
         StartupArgs::Fish(ref args) => {
-            generate_fish_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_fish_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
         StartupArgs::Tcsh(ref args) => {
-            generate_tcsh_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_tcsh_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
         StartupArgs::Zsh(ref args) => {
-            generate_zsh_startup_commands(args, &ctx.env_diff, &mut writer)?
+            generate_zsh_startup_commands(args, &ctx.start_diff, &mut writer)?
         },
     }
     Ok(())
@@ -243,7 +243,7 @@ fn write_to_stdout(ctx: &StartupCtx) -> Result<()> {
 fn activate_exec_command(
     exec_command: Vec<String>,
     _startup_ctx: StartupCtx,
-    activation_env: &ActivationEnv,
+    attach_diff: &AttachDiff,
 ) -> Result<()> {
     if exec_command.is_empty() {
         return Err(anyhow!("empty command provided"));
@@ -252,7 +252,7 @@ fn activate_exec_command(
     if exec_command.len() > 1 {
         command.args(&exec_command[1..]);
     };
-    activation_env.apply_to_command(&mut command);
+    attach_diff.apply_to_command(&mut command);
 
     debug!("executing command directly: {:?}", command);
 
@@ -268,10 +268,10 @@ fn activate_exec_command(
 fn activate_shell_command(
     shell_command: String,
     startup_ctx: StartupCtx,
-    activation_env: &ActivationEnv,
+    attach_diff: &AttachDiff,
 ) -> Result<()> {
     let mut command = Command::new(startup_ctx.act_ctx.shell.exe_path());
-    activation_env.apply_to_command(&mut command);
+    attach_diff.apply_to_command(&mut command);
 
     let rcfile = startup_ctx
         .rc_path
@@ -381,9 +381,9 @@ fn activate_shell_command(
 /// and running the respective activation scripts.
 ///
 /// This function should never return as it replaces the current process
-fn activate_interactive(startup_ctx: StartupCtx, activation_env: &ActivationEnv) -> Result<()> {
+fn activate_interactive(startup_ctx: StartupCtx, attach_diff: &AttachDiff) -> Result<()> {
     let mut command = Command::new(startup_ctx.act_ctx.shell.exe_path());
-    activation_env.apply_to_command(&mut command);
+    attach_diff.apply_to_command(&mut command);
 
     let rcfile = startup_ctx
         .rc_path
@@ -474,7 +474,7 @@ fn activate_interactive(startup_ctx: StartupCtx, activation_env: &ActivationEnv)
 fn activate_in_place(
     startup_ctx: StartupCtx,
     start_id: StartIdentifier,
-    activation_env: &ActivationEnv,
+    attach_diff: &AttachDiff,
 ) -> Result<()> {
     let attach_command = AttachArgs {
         pid: std::process::id() as i32,
@@ -491,7 +491,7 @@ fn activate_in_place(
     attach_command.handle()?;
 
     let shell = Shell::from(startup_ctx.act_ctx.shell.clone());
-    let activation_exports = render_activation_exports(activation_env, shell)?;
+    let activation_exports = render_attach_exports(attach_diff, shell)?;
 
     let exports_for_zsh = if matches!(startup_ctx.act_ctx.shell, ShellWithPath::Zsh(_)) {
         let zdotdir_path = startup_ctx
@@ -540,26 +540,22 @@ fn activate_in_place(
     Ok(())
 }
 
-/// Render all activation environment variables as shell export statements.
+/// Render all attach environment variables as shell export statements.
 ///
-/// Reads from the pre-computed `ActivationEnv` so that in-place activations
+/// Reads from the pre-computed `AttachDiff` so that in-place activations
 /// set the same variables as other invocation types.
-fn render_activation_exports(activation_env: &ActivationEnv, shell: Shell) -> Result<String> {
+fn render_attach_exports(attach_diff: &AttachDiff, shell: Shell) -> Result<String> {
     let mut buf: Vec<u8> = Vec::new();
 
     // Sort for deterministic output.
-    for (key, value) in activation_env
-        .sets
-        .iter()
-        .sorted_by_key(|(k, _)| k.as_str())
-    {
+    for (key, value) in attach_diff.sets.iter().sorted_by_key(|(k, _)| k.as_str()) {
         SetVar::exported_no_expansion(key, value).generate_with_newline(shell, &mut buf)?;
     }
-    for key in activation_env.removals.iter().sorted() {
+    for key in attach_diff.removals.iter().sorted() {
         UnsetVar::new(key).generate_with_newline(shell, &mut buf)?;
     }
 
-    if let Some(ref encoded) = activation_env.encoded_diff {
+    if let Some(ref encoded) = attach_diff.encoded_diff {
         SetVar::exported_no_expansion(activation_diff::FLOX_HOOK_DIFF_VAR, encoded)
             .generate_with_newline(shell, &mut buf)?;
     }

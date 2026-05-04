@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::activation_diff::{self, ActivationDiff};
 use crate::cli::fix_paths::{fix_manpath_var, fix_path_var};
 use crate::cli::set_env_dirs::fix_env_dirs_var;
-use crate::env_diff::EnvDiff;
+use crate::start_diff::StartDiff;
 use crate::vars_from_env::VarsFromEnvironment;
 pub const FLOX_PROMPT_ENVIRONMENTS_VAR: &str = "FLOX_PROMPT_ENVIRONMENTS";
 
@@ -41,14 +41,14 @@ pub(super) fn assemble_activate_command(
     command
 }
 
-/// The complete set of environment variable changes needed for activation.
+/// The complete set of environment variable changes needed for attaching.
 ///
-/// Constructed once from the activation context, this struct is the single
+/// Constructed once from the attach context, this struct is the single
 /// source of truth for what variables to set and unset. All consumers
 /// (command application, in-place export rendering, activation diff
 /// computation) draw from the same data.
 #[derive(Debug, Clone)]
-pub struct ActivationEnv {
+pub struct AttachDiff {
     /// Variables to set on the command/shell.
     pub sets: HashMap<String, String>,
     /// Variables to unset from the command/shell.
@@ -57,7 +57,7 @@ pub struct ActivationEnv {
     pub encoded_diff: Option<String>,
 }
 
-impl ActivationEnv {
+impl AttachDiff {
     /// Assemble all environment variable sets and removals needed for
     /// activation, and compute the activation diff if a pre-activation
     /// snapshot is available.
@@ -65,13 +65,13 @@ impl ActivationEnv {
     /// Sources are applied in precedence order (later overrides earlier):
     /// 1. `old_cli_envs()` — FLOX_* context vars + default nix vars
     /// 2. `collect_activate_exports()` — activation context vars
-    /// 3. `env_diff.additions` / `env_diff.deletions` — from activation scripts
+    /// 3. `start_diff.additions` / `start_diff.deletions` — from activation scripts
     pub fn new(
         context: &AttachCtx,
         project: Option<&AttachProjectCtx>,
         subsystem_verbosity: u32,
         mut vars_from_env: VarsFromEnvironment,
-        env_diff: &EnvDiff,
+        start_diff: &StartDiff,
     ) -> Result<Self> {
         // Extract the pre-activation snapshot before consuming vars_from_env.
         let full_env = vars_from_env.full_env.take();
@@ -89,7 +89,7 @@ impl ActivationEnv {
             sets.insert(k.to_string(), v);
         }
 
-        for (k, v) in &env_diff.additions {
+        for (k, v) in &start_diff.additions {
             sets.insert(k.clone(), v.clone());
         }
 
@@ -97,7 +97,7 @@ impl ActivationEnv {
         for k in &removal_list {
             removals.insert(k.to_string());
         }
-        for k in &env_diff.deletions {
+        for k in &start_diff.deletions {
             removals.insert(k.clone());
         }
 
